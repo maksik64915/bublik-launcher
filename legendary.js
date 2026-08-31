@@ -1,0 +1,777 @@
+// legendary.js
+//
+// Thin wrapper around the `legendary` command-line tool.
+// Bublik Launcher does NOT talk to Epic's servers itself, does NOT store or
+// see the user's password, and does NOT implement any private Epic protocol.
+// Every login / library / download / launch action is delegated to the
+// `legendary` binary — either one already on the user's PATH, or one we
+// fetch on their behalf straight from legendary's own official GitHub
+// releases (see downloadLegendaryBinary below). This module only spawns
+// that process and parses its stdout.
+//
+// Docs / source of the underlying tool: https://github.com/derrod/legendary
+
+const { spawn, spawnSync } = require('child_process');
+const https = require('https');
+const path = require('path');
+const os = require('os');
+const fs = require('fs');
+
+// Resolve which executable to call, checked fresh on every invocation (not
+// once at startup) so it picks up a binary we just auto-downloaded without
+// needing a restart. Priority: explicit override env var > our own managed
+// copy (see downloadLegendaryBinary below) > whatever's on PATH.
+const LEGENDARY_BIN_DIR = path.join(os.homedir(), '.config', 'bublik-launcher', 'bin');
+
+function getManagedLegendaryPath() {
+  const name = process.platform === 'win32' ? 'legendary.exe' : 'legendary';
+  return path.join(LEGENDARY_BIN_DIR, name);
+}
+
+function resolveLegendaryBin() {
+  if (process.env.BUBLIK_LEGENDARY_BIN) return process.env.BUBLIK_LEGENDARY_BIN;
+  const managed = getManagedLegendaryPath();
+  if (fs.existsSync(managed)) return managed;
+  return 'legendary';
+}
+
+function run(args, { onLine } = {}) {
+  return new Promise((resolve, reject) => {
+    let proc;
+    try {
+      proc = spawn(resolveLegendaryBin(), args, { windowsHide: true });
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    let stdout = '';
+    let stderr = '';
+
+    const handleChunk = (buf, isErr) => {
+      const text = buf.toString('utf8');
+      if (isErr) stderr += text; else stdout += text;
+      if (onLine) {
+        text.split(/\r?\n/).filter(Boolean).forEach((line) => onLine(line, isErr));
+      }
+    };
+
+    proc.stdout.on('data', (b) => handleChunk(b, false));
+    proc.stderr.on('data', (b) => handleChunk(b, true));
+
+    proc.on('error', (err) => {
+      // ENOENT etc — most commonly "legendary isn't installed / on PATH"
+      reject(err);
+    });
+
+    proc.on('close', (code) => {
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
+async function checkInstalled() {
+  try {
+    const { code, stdout } = await run(['--version']);
+    if (code === 0) return { installed: true, version: stdout.trim() };
+    return { installed: false };
+  } catch {
+    return { installed: false };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-download legendary itself. Its own README explicitly recommends this
+// exact path for people without Python: "Download the legendary or
+// legendary.exe binary from the latest release" — these are official
+// PyInstaller-built standalone binaries, not a third-party mirror.
+const LEGENDARY_RELEASES_API = 'https://api.github.com/repos/derrod/legendary/releases/latest';
+
+async function downloadLegendaryBinary(onProgress) {
+  const log = onProgress || (() => {});
+  const targetPath = getManagedLegendaryPath();
+  if (fs.existsSync(targetPath)) return { ok: true, path: targetPath, cached: true };
+
+  log('Шукаю останній реліз legendary на GitHub...');
+  let release;
+  try {
+    release = await httpsGetJson(LEGENDARY_RELEASES_API);
+  } catch (err) {
+    return { ok: false, message: 'Не вдалося звернутись до GitHub: ' + String((err && err.message) || err) };
+  }
+
+  const assetName = process.platform === 'win32' ? 'legendary.exe' : 'legendary';
+  const asset = (release.assets || []).find((a) => a.name === assetName);
+  if (!asset) {
+    return {
+      ok: false,
+      message: `Не знайдено файл "${assetName}" у релізі legendary ${release.tag_name || ''}. ` +
+        'Постав вручну: pip install legendary-gl',
+    };
+  }
+
+  log(`Завантажую ${asset.name} (${release.tag_name || ''})...`);
+  try {
+    const res = await httpsGetFollowing(asset.browser_download_url);
+    fs.mkdirSync(LEGENDARY_BIN_DIR, { recursive: true });
+    await new Promise((resolve, reject) => {
+      const file = fs.createWriteStream(targetPath);
+      res.pipe(file);
+      file.on('finish', () => file.close(resolve));
+      file.on('error', reject);
+    });
+    if (process.platform !== 'win32') {
+      fs.chmodSync(targetPath, 0o755);
+    }
+    return { ok: true, path: targetPath, cached: false, version: release.tag_name };
+  } catch (err) {
+    try { fs.unlinkSync(targetPath); } catch { /* nothing to clean up */ }
+    return { ok: false, message: String((err && err.message) || err) };
+  }
+}
+
+async function checkAuthStatus() {
+  // `legendary status` prints account info when logged in and a
+  // "not logged in" style message otherwise (exact wording varies by
+  // version, so we key off exit code / absence of an account name).
+  try {
+    const { code, stdout } = await run(['status', '--json']);
+    if (code === 0) {
+      try {
+        const data = JSON.parse(stdout);
+        if (data && data.account) {
+          return { loggedIn: true, account: data.account };
+        }
+      } catch {
+        // Older legendary versions don't support --json; fall through.
+      }
+    }
+  } catch {
+    // ignore, try legacy path below
+  }
+
+  try {
+    const { stdout } = await run(['status']);
+    const match = stdout.match(/Epic account:\s*(.+)/i);
+    if (match && !/not logged in/i.test(stdout)) {
+      return { loggedIn: true, account: match[1].trim() };
+    }
+  } catch {
+    // legendary not installed — handled by checkInstalled elsewhere
+  }
+  return { loggedIn: false };
+}
+
+// Step 1: the URL that gets loaded (in our embedded <webview>, same as the
+// store). This is Epic's own official login page — Bublik Launcher never
+// sees the password, only the one-time authorization code Epic shows at
+// the end. The clientId here is legendary's own public OAuth client id
+// (same one the official-replacement CLI uses) — it must match exactly or
+// Epic rejects it with "clientId has an invalid value".
+const EPIC_CLIENT_ID = '34a02cf8f4414e29b15921876da36f9a';
+
+function getEpicLoginUrl() {
+  return 'https://www.epicgames.com/id/login?redirectUrl=' +
+    encodeURIComponent(
+      `https://www.epicgames.com/id/api/redirect?clientId=${EPIC_CLIENT_ID}&responseType=code`
+    );
+}
+
+// Step 2: exchange the authorization code for tokens. This mirrors exactly
+// what `legendary auth --code <code>` does. Accepts either a bare code or
+// the full JSON blob Epic shows on the redirect page (in case a manual
+// paste includes the braces) — same tolerance legendary's own CLI has.
+async function loginWithCode(code) {
+  let trimmed = (code || '').trim();
+  if (!trimmed) return { ok: false, message: 'Порожній код авторизації.' };
+  if (trimmed[0] === '{') {
+    try {
+      trimmed = JSON.parse(trimmed).authorizationCode;
+    } catch {
+      return { ok: false, message: 'Не вдалося розпізнати JSON з кодом авторизації.' };
+    }
+  } else {
+    trimmed = trimmed.replace(/^"|"$/g, '');
+  }
+  if (!trimmed) return { ok: false, message: 'Порожній код авторизації.' };
+  const { code: exitCode, stdout, stderr } = await run(['auth', '--code', trimmed]);
+  if (exitCode === 0) return { ok: true };
+  return { ok: false, message: (stderr || stdout || 'Не вдалося увійти.').trim() };
+}
+
+async function logout() {
+  const { code, stdout, stderr } = await run(['auth', '--delete']);
+  return { ok: code === 0, message: (stderr || stdout || '').trim() };
+}
+
+// Preferred key-image types for a poster-style tile, best first. Epic's
+// catalog attaches several crops/aspects per game under metadata.keyImages;
+// not every game has every type, so we fall back down the list.
+const COVER_IMAGE_PRIORITY = [
+  'DieselGameBoxTall',
+  'OfferImageTall',
+  'DieselStoreFrontTall',
+  'DieselGameBox',
+  'Thumbnail',
+  'OfferImageWide',
+  'DieselStoreFrontWide',
+];
+
+function pickCoverUrl(metadata) {
+  const images = metadata && Array.isArray(metadata.keyImages) ? metadata.keyImages : [];
+  if (!images.length) return null;
+  for (const type of COVER_IMAGE_PRIORITY) {
+    const match = images.find((img) => img.type === type && img.url);
+    if (match) return match.url;
+  }
+  // last resort: whatever image is there
+  return images[0].url || null;
+}
+
+// Library = everything on the account, whether installed locally or not.
+async function listLibrary() {
+  const { code, stdout } = await run(['list', '--json']);
+  if (code !== 0) return [];
+  try {
+    const data = JSON.parse(stdout);
+    return data.map((g) => ({
+      appName: g.app_name,
+      title: g.app_title || g.title || g.app_name,
+      version: g.app_version || g.version || null,
+      coverUrl: pickCoverUrl(g.metadata),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+async function listInstalled() {
+  const { code, stdout } = await run(['list-installed', '--json']);
+  if (code !== 0) return [];
+  try {
+    const data = JSON.parse(stdout);
+    return data.map((g) => ({
+      appName: g.app_name,
+      title: g.title || g.app_name,
+      version: g.version || null,
+      installSize: g.install_size || null,
+      installPath: g.install_path || null,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+// Streams progress lines back to the renderer via `onLine`; the renderer is
+// responsible for parsing the "Progress: NN.NN%" style lines it cares about.
+async function installGame(appName, onLine, basePath) {
+  const args = ['install', appName];
+  if (basePath) args.push('--base-path', basePath);
+  args.push('-y');
+  return run(args, { onLine });
+}
+
+// `legendary launch <app>` normally spawns the game itself and then exits
+// right away (it doesn't wait around) — which means we'd have no handle on
+// the actual game process to close it later. Instead we ask legendary for
+// the resolved launch parameters (`--json`, which returns them without
+// launching anything) and spawn the game ourselves, so we keep the process
+// handle for the whole session.
+async function getLaunchParams(appName, onLine) {
+  const { code, stdout, stderr } = await run(['launch', appName, '--json'], { onLine });
+  if (code !== 0) {
+    return { ok: false, message: (stderr || stdout || 'Не вдалося отримати параметри запуску.').trim() };
+  }
+  try {
+    const jsonText = stdout.trim();
+    const start = jsonText.indexOf('{');
+    const params = JSON.parse(start >= 0 ? jsonText.slice(start) : jsonText);
+    return { ok: true, params };
+  } catch {
+    return { ok: false, message: 'Не вдалося розібрати параметри запуску, отримані від legendary.' };
+  }
+}
+
+function spawnGameProcess(params) {
+  const exePath = path.join(params.game_directory, params.game_executable);
+  const args = [
+    ...(params.launch_command || []),
+    exePath,
+    ...(params.game_parameters || []),
+    ...(params.user_parameters || []),
+    ...(params.egl_parameters || []),
+  ];
+  const bin = args.shift();
+  const env = { ...process.env, ...(params.environment || {}) };
+  // detached (POSIX only) puts the game in its own process group so
+  // killProcessTree can take down the whole tree, not just this one PID.
+  return spawn(bin, args, {
+    cwd: params.working_directory || params.game_directory,
+    env,
+    detached: process.platform !== 'win32',
+    windowsHide: false,
+  });
+}
+
+function killProcessTree(proc) {
+  if (!proc || proc.killed || proc.exitCode !== null) return;
+  if (process.platform === 'win32') {
+    try {
+      spawnSync('taskkill', ['/pid', String(proc.pid), '/T', '/F']);
+    } catch {
+      try { proc.kill(); } catch { /* already gone */ }
+    }
+  } else {
+    try {
+      process.kill(-proc.pid, 'SIGTERM');
+    } catch {
+      try { proc.kill('SIGTERM'); } catch { /* already gone */ }
+    }
+  }
+}
+
+async function uninstallGame(appName, onLine) {
+  return run(['uninstall', appName, '-y'], { onLine });
+}
+
+// ---------------------------------------------------------------------------
+// Per-game settings (Wine/Proton, wrapper, env vars, offline mode, etc).
+// This is NOT a new mechanism we invented — it's legendary's own documented
+// config.ini format (the same file/keys Heroic writes to under the hood).
+// We only read/patch it; legendary itself is what actually uses it on launch.
+//
+// IMPORTANT, and worth being upfront about: none of this can "unlock" anti-
+// cheat on a game that doesn't support Linux. Easy Anti-Cheat/BattlEye on
+// Linux is enabled per-game by the developer on Epic's/BattlEye's backend —
+// a client-side setting has no way to override that. If a game's dev has
+// turned it on, running it through Proton here just works like any other
+// game; if they haven't, no local setting changes that. Fortnite specifically
+// is deliberately blocked by Epic on Linux and will not work here regardless.
+
+function getConfigPath() {
+  if (process.env.LEGENDARY_CONFIG_PATH) {
+    return path.join(process.env.LEGENDARY_CONFIG_PATH, 'config.ini');
+  }
+  const base = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+  return path.join(base, 'legendary', 'config.ini');
+}
+
+// Minimal INI parser — good enough for legendary's flat [section] / key = value
+// format (no nesting, no multi-line values). Comments and unknown sections
+// outside the ones we touch are preserved by round-tripping through this
+// same representation; per-line comments *inside* an edited section are not
+// preserved (acceptable trade-off for a settings UI).
+function parseIni(text) {
+  const sections = {};
+  let current = null;
+  text.split(/\r?\n/).forEach((raw) => {
+    const line = raw.trim();
+    if (!line || line.startsWith(';') || line.startsWith('#')) return;
+    const sectionMatch = line.match(/^\[(.+)\]$/);
+    if (sectionMatch) {
+      current = sectionMatch[1];
+      if (!sections[current]) sections[current] = {};
+      return;
+    }
+    const eq = line.indexOf('=');
+    if (eq > 0 && current) {
+      const key = line.slice(0, eq).trim();
+      const value = line.slice(eq + 1).trim();
+      sections[current][key] = value;
+    }
+  });
+  return sections;
+}
+
+function stringifyIni(sections) {
+  let out = '';
+  for (const [name, kv] of Object.entries(sections)) {
+    const keys = Object.keys(kv);
+    if (!keys.length) continue; // drop empty sections entirely
+    out += `[${name}]\n`;
+    for (const key of keys) out += `${key} = ${kv[key]}\n`;
+    out += '\n';
+  }
+  return out;
+}
+
+function readConfig() {
+  const p = getConfigPath();
+  try {
+    return { path: p, sections: parseIni(fs.readFileSync(p, 'utf8')) };
+  } catch {
+    return { path: p, sections: {} };
+  }
+}
+
+// Returns the current [AppName] and [AppName.env] sections for a game.
+function getGameSettings(appName) {
+  const { sections } = readConfig();
+  return {
+    main: sections[appName] || {},
+    env: sections[`${appName}.env`] || {},
+  };
+}
+
+// mainPatch: object of known keys to set; an empty-string value deletes that
+// key. envVars: the FULL desired [AppName.env] section (the settings form
+// shows the complete list, so this replaces rather than merges).
+function saveGameSettings(appName, mainPatch, envVars) {
+  const { path: p, sections } = readConfig();
+
+  const main = { ...(sections[appName] || {}) };
+  for (const [key, value] of Object.entries(mainPatch || {})) {
+    if (value === '' || value === null || value === undefined) delete main[key];
+    else main[key] = value;
+  }
+  if (Object.keys(main).length) sections[appName] = main;
+  else delete sections[appName];
+
+  const envKey = `${appName}.env`;
+  const cleanEnv = {};
+  for (const [key, value] of Object.entries(envVars || {})) {
+    if (key && value !== '' && value !== null && value !== undefined) cleanEnv[key] = value;
+  }
+  if (Object.keys(cleanEnv).length) sections[envKey] = cleanEnv;
+  else delete sections[envKey];
+
+  try {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, stringifyIni(sections), 'utf8');
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, message: String((err && err.message) || err) };
+  }
+}
+
+function httpsGetJson(url) {
+  return new Promise((resolve, reject) => {
+    httpsGetFollowing(url).then(
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          try { resolve(JSON.parse(data)); } catch (err) { reject(err); }
+        });
+        res.on('error', reject);
+      },
+      reject
+    );
+  });
+}
+
+// ---------------------------------------------------------------------------
+// GE-Proton (GloriousEggroll's community Proton build) is a real, actively
+// maintained open-source project with public GitHub releases — not a mirror
+// of someone else's proprietary tool. That makes it the one piece of this
+// puzzle we can legitimately auto-download in full, the same way Lutris's
+// and Heroic's own updater scripts do.
+// https://github.com/GloriousEggroll/proton-ge-custom
+const GE_PROTON_RELEASES_API = 'https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest';
+const PROTON_BASE_DIR = path.join(os.homedir(), '.config', 'bublik-launcher', 'proton');
+
+function findLocalGeProton() {
+  try {
+    const dirs = fs
+      .readdirSync(PROTON_BASE_DIR, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      // Ignore ARM builds entirely — GE-Proton's releases bundle both, and
+      // an aarch64 build's wine binary fails with "Exec format error" on a
+      // normal x86_64 machine. Only match names WITHOUT an arm/aarch64 tag.
+      .filter((name) => !/aarch64|arm64|-arm(?:[^a-z0-9]|$)/i.test(name))
+      .filter((name) => fs.existsSync(path.join(PROTON_BASE_DIR, name, 'proton')))
+      .sort();
+    if (!dirs.length) return null;
+    return path.join(PROTON_BASE_DIR, dirs[dirs.length - 1]);
+  } catch {
+    return null;
+  }
+}
+
+async function downloadGeProton(onProgress) {
+  // Clean up any wrong-architecture build from a previous run so it doesn't
+  // just sit there taking up space once we stop selecting it.
+  try {
+    fs.readdirSync(PROTON_BASE_DIR, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && /aarch64|arm64|-arm(?:[^a-z0-9]|$)/i.test(e.name))
+      .forEach((e) => fs.rmSync(path.join(PROTON_BASE_DIR, e.name), { recursive: true, force: true }));
+  } catch { /* best effort, PROTON_BASE_DIR may not exist yet */ }
+
+  const existing = findLocalGeProton();
+  if (existing) return { ok: true, path: existing, cached: true };
+
+  if (onProgress) onProgress('Шукаю останній випуск GE-Proton на GitHub...');
+  let release;
+  try {
+    release = await httpsGetJson(GE_PROTON_RELEASES_API);
+  } catch (err) {
+    return { ok: false, message: 'Не вдалося звернутись до GitHub: ' + String((err && err.message) || err) };
+  }
+  const candidates = (release.assets || []).filter(
+    (a) => /\.tar\.(gz|xz)$/.test(a.name) && !/sha512sum/i.test(a.name)
+  );
+  // GE-Proton releases bundle multiple architectures in the same release —
+  // picking the first match blindly grabbed an aarch64 build once, which
+  // fails with "Exec format error" on a normal x86_64 machine. Explicitly
+  // prefer a name with no arm/aarch64 tag.
+  const asset =
+    candidates.find((a) => !/aarch64|arm64|-arm(?:[^a-z0-9]|$)/i.test(a.name)) || candidates[0];
+  if (!asset) return { ok: false, message: 'Не знайдено файл релізу GE-Proton.' };
+
+  if (onProgress) onProgress(`Завантажую ${asset.name}...`);
+  const tmpFile = path.join(os.tmpdir(), `bublik-geproton-${Date.now()}-${asset.name}`);
+  try {
+    const res = await httpsGetFollowing(asset.browser_download_url);
+    await new Promise((resolve, reject) => {
+      const file = fs.createWriteStream(tmpFile);
+      res.pipe(file);
+      file.on('finish', () => file.close(resolve));
+      file.on('error', reject);
+    });
+    fs.mkdirSync(PROTON_BASE_DIR, { recursive: true });
+    if (onProgress) onProgress('Розпаковую GE-Proton...');
+    const tarFlag = asset.name.endsWith('.xz') ? '-xJf' : '-xzf';
+    const extract = spawnSync('tar', [tarFlag, tmpFile, '-C', PROTON_BASE_DIR]);
+    if (extract.status !== 0) {
+      return { ok: false, message: 'Не вдалося розпакувати GE-Proton (потрібен tar із підтримкою gzip/xz).' };
+    }
+    const found = findLocalGeProton();
+    if (!found) return { ok: false, message: 'GE-Proton розпаковано, але файл proton не знайдено всередині.' };
+    return { ok: true, path: found, cached: false, version: release.tag_name };
+  } catch (err) {
+    return { ok: false, message: String((err && err.message) || err) };
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch { /* never created / already gone */ }
+  }
+}
+
+// One-shot orchestration: Steam path, GE-Proton, a per-game prefix folder,
+// and the EAC runtime — everything the Proton launch mode needs, gathered
+// automatically. Doesn't touch legendary's config directly; the caller
+// applies the result with saveGameSettings so the renderer stays the single
+// place that decides what gets written.
+async function autoConfigureAntiCheat(appName, onLine) {
+  const log = onLine || (() => {});
+
+  log('Шукаю встановлений Steam...');
+  let steamClientPath = detectSteamPath();
+  if (!steamClientPath) {
+    steamClientPath = path.join(os.homedir(), '.config', 'bublik-launcher', 'dummy-steam');
+    try { fs.mkdirSync(steamClientPath, { recursive: true }); } catch { /* best effort */ }
+    log('Steam не знайдено — використовую заглушку. Якщо Proton все одно впаде з помилкою про ' +
+      'STEAM_COMPAT_CLIENT_INSTALL_PATH, встанови Steam (можна взагалі без ігор) і повтори.');
+  } else {
+    log(`Знайдено Steam: ${steamClientPath}`);
+  }
+
+  log('Шукаю/завантажую GE-Proton...');
+  const protonRes = await downloadGeProton(log);
+  if (!protonRes.ok) return { ok: false, message: protonRes.message };
+  log(protonRes.cached
+    ? `Використовую вже завантажений GE-Proton: ${protonRes.path}`
+    : `Завантажено GE-Proton ${protonRes.version || ''}: ${protonRes.path}`);
+
+  const prefixPath = path.join(os.homedir(), '.config', 'bublik-launcher', 'prefixes', appName);
+  try {
+    fs.mkdirSync(prefixPath, { recursive: true });
+    log(`Тека префікса: ${prefixPath}`);
+  } catch (err) {
+    return { ok: false, message: 'Не вдалося створити теку префікса: ' + String((err && err.message) || err) };
+  }
+
+  log('Перевіряю EasyAntiCheat runtime...');
+  const eacRes = await downloadEacRuntime();
+  let eacPath = null;
+  if (eacRes.ok) {
+    eacPath = eacRes.path;
+    log(eacRes.cached ? `EAC runtime вже готовий: ${eacRes.path}` : `EAC runtime завантажено: ${eacRes.path}`);
+  } else {
+    log('Не вдалося підготувати EAC runtime автоматично: ' + eacRes.message);
+  }
+
+  return { ok: true, protonPath: protonRes.path, prefixPath, steamClientPath, eacPath };
+}
+
+
+// "point me at a Steam-installed folder" step above is optional rather than
+// mandatory. Source: a community-maintained mirror hosted directly inside
+// ValveSoftware/Proton's own GitHub repo (the same file Lutris's install
+// scripts pull from). This is NOT guaranteed to be as fresh as Valve's own
+// Steam tool — flag that clearly in the UI — but it's a real, working,
+// third-party-verifiable file, not something invented for this project.
+const EAC_RUNTIME_MIRROR_URL =
+  'https://github.com/ValveSoftware/Proton/files/4839724/easyanticheat_wine_x64.tar.gz';
+
+function httpsGetFollowing(url, redirectsLeft = 6) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, { headers: { 'User-Agent': 'bublik-launcher' } }, (res) => {
+        const loc = res.headers.location;
+        if ([301, 302, 303, 307, 308].includes(res.statusCode) && loc && redirectsLeft > 0) {
+          res.resume();
+          httpsGetFollowing(loc, redirectsLeft - 1).then(resolve, reject);
+          return;
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          reject(new Error(`HTTP ${res.statusCode} під час завантаження runtime.`));
+          return;
+        }
+        resolve(res);
+      })
+      .on('error', reject);
+  });
+}
+
+async function downloadEacRuntime() {
+  const targetDir = path.join(os.homedir(), '.config', 'bublik-launcher', 'runtimes', 'eac');
+  try {
+    if (fs.existsSync(targetDir) && fs.readdirSync(targetDir).length > 0) {
+      return { ok: true, path: targetDir, cached: true };
+    }
+  } catch { /* fall through to (re)download */ }
+
+  const tmpFile = path.join(os.tmpdir(), `bublik-eac-${Date.now()}.tar.gz`);
+  try {
+    const res = await httpsGetFollowing(EAC_RUNTIME_MIRROR_URL);
+    await new Promise((resolve, reject) => {
+      const file = fs.createWriteStream(tmpFile);
+      res.pipe(file);
+      file.on('finish', () => file.close(resolve));
+      file.on('error', reject);
+    });
+    fs.mkdirSync(targetDir, { recursive: true });
+    const extract = spawnSync('tar', ['-xzf', tmpFile, '-C', targetDir]);
+    if (extract.status !== 0) {
+      return {
+        ok: false,
+        message: 'Не вдалося розпакувати архів (потрібна встановлена утиліта tar).',
+      };
+    }
+    return { ok: true, path: targetDir };
+  } catch (err) {
+    return { ok: false, message: String((err && err.message) || err) };
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch { /* already gone / never created */ }
+  }
+}
+
+// Best-effort detection of a local Steam client install — needed because
+// launching through real Proton (not just a raw wine binary) requires
+// STEAM_COMPAT_CLIENT_INSTALL_PATH to point at *some* Steam client dir, or
+// Proton's own script crashes with a KeyError before it even gets to the
+// game. Steam itself doesn't need to be running — this is just a path Proton
+// reads a couple of things from.
+function detectSteamPath() {
+  const candidates = [
+    path.join(os.homedir(), '.steam', 'steam'),
+    path.join(os.homedir(), '.local', 'share', 'Steam'),
+    path.join(os.homedir(), '.var', 'app', 'com.valvesoftware.Steam', '.local', 'share', 'Steam'),
+    path.join(os.homedir(), '.steam', 'root'),
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) return candidate;
+    } catch { /* keep looking */ }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Playtime tracking. legendary itself has no concept of this — we own the
+// game's process handle (see spawnGameProcess/killProcessTree above), so we
+// measure start-to-exit ourselves and persist totals in our own small file.
+const PLAYTIME_FILE = path.join(os.homedir(), '.config', 'bublik-launcher', 'playtime.json');
+
+function readPlaytime() {
+  try {
+    return JSON.parse(fs.readFileSync(PLAYTIME_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function getPlaytime() {
+  return readPlaytime();
+}
+
+// Returns the game's new total (seconds) after adding this session.
+function addPlaytime(appName, seconds) {
+  const data = readPlaytime();
+  data[appName] = (data[appName] || 0) + Math.max(0, Math.round(seconds));
+  try {
+    fs.mkdirSync(path.dirname(PLAYTIME_FILE), { recursive: true });
+    fs.writeFileSync(PLAYTIME_FILE, JSON.stringify(data), 'utf8');
+  } catch { /* best effort — losing one session's playtime isn't worth crashing over */ }
+  return data[appName];
+}
+
+// ---------------------------------------------------------------------------
+// AppImage desktop integration. AppImages don't show up in the system's
+// application menu just from being downloaded — nothing registers them.
+// The common fix is a separate tool (AppImageLauncher), but we can just do
+// it ourselves: the AppImage runtime sets $APPIMAGE to the .AppImage file's
+// own path for every process it launches, so on every start we (re)write a
+// .desktop entry pointing at that exact path — cheap, idempotent, and it
+// stays correct even if the user renames or moves the file. No-ops entirely
+// when not actually running from an AppImage (dev mode, Windows, macOS).
+function ensureDesktopIntegration() {
+  const appImagePath = process.env.APPIMAGE;
+  if (!appImagePath) return;
+
+  try {
+    const iconDir = path.join(os.homedir(), '.local', 'share', 'icons', 'hicolor', '256x256', 'apps');
+    fs.mkdirSync(iconDir, { recursive: true });
+    const iconSrc = path.join(__dirname, 'renderer', 'assets', 'icon.png');
+    if (fs.existsSync(iconSrc)) {
+      fs.copyFileSync(iconSrc, path.join(iconDir, 'bublik-launcher.png'));
+    }
+
+    const appsDir = path.join(os.homedir(), '.local', 'share', 'applications');
+    fs.mkdirSync(appsDir, { recursive: true });
+    const desktopEntry =
+      '[Desktop Entry]\n' +
+      'Type=Application\n' +
+      'Name=Bublik Launcher\n' +
+      'Comment=Epic Games launcher built on the legendary CLI\n' +
+      `Exec="${appImagePath}" --class=bublik-launcher %U\n` +
+      'Icon=bublik-launcher\n' +
+      'Categories=Game;\n' +
+      'Terminal=false\n' +
+      'StartupWMClass=bublik-launcher\n';
+    fs.writeFileSync(path.join(appsDir, 'bublik-launcher.desktop'), desktopEntry, 'utf8');
+
+    // Best-effort — most desktop environments also pick this up on their own
+    // periodic rescan, this just makes it show up immediately without a
+    // logout/login. Fine if the command isn't installed.
+    spawnSync('update-desktop-database', [appsDir]);
+    spawnSync('gtk-update-icon-cache', ['-f', '-t', path.join(os.homedir(), '.local', 'share', 'icons', 'hicolor')]);
+  } catch {
+    // Desktop integration is a nicety, never worth crashing launch over.
+  }
+}
+
+module.exports = {
+  checkInstalled,
+  downloadLegendaryBinary,
+  checkAuthStatus,
+  getEpicLoginUrl,
+  loginWithCode,
+  logout,
+  listLibrary,
+  listInstalled,
+  installGame,
+  getLaunchParams,
+  spawnGameProcess,
+  killProcessTree,
+  uninstallGame,
+  getGameSettings,
+  saveGameSettings,
+  downloadEacRuntime,
+  detectSteamPath,
+  autoConfigureAntiCheat,
+  getPlaytime,
+  addPlaytime,
+  ensureDesktopIntegration,
+};

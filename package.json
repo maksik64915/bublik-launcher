@@ -1,0 +1,51 @@
+{
+  "name": "bublik-launcher",
+  "version": "0.1.0",
+  "description": "Bublik Launcher — a desktop UI wrapper around the open-source Legendary CLI for the Epic Games Store.",
+  "main": "main.js",
+  "author": "You",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win",
+    "dist:portable": "electron-builder --win portable",
+    "dist:linux": "electron-builder --linux AppImage"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.bublik.launcher",
+    "productName": "Bublik Launcher",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "legendary.js",
+      "renderer/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
+      ],
+      "icon": "renderer/assets/icon.png"
+    },
+    "linux": {
+      "target": ["AppImage"],
+      "icon": "renderer/assets/icon.png",
+      "category": "Game",
+      "executableName": "bublik-launcher"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
+  }
+}

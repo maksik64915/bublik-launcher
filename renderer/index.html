@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https:; script-src 'self'; frame-src https:; child-src https:;" />
+<title>Bublik Launcher</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <div class="app" id="app">
+
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">Bublik<span class="brand-name-accent">Launcher</span></span>
+      </div>
+
+      <nav class="nav">
+        <button class="nav-item" data-view="store">
+          <span class="nav-ico" data-ico="store"></span> <span data-i18n="nav.store">Магазин</span>
+        </button>
+        <button class="nav-item is-active" data-view="library">
+          <span class="nav-ico" data-ico="grid"></span> <span data-i18n="nav.library">Бібліотека</span>
+        </button>
+        <button class="nav-item" data-view="installed">
+          <span class="nav-ico" data-ico="disk"></span> <span data-i18n="nav.installed">Встановлені</span>
+        </button>
+        <button class="nav-item" data-view="settings">
+          <span class="nav-ico" data-ico="gear"></span> <span data-i18n="nav.settings">Налаштування</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <button class="console-toggle" id="consoleToggle">
+          <span class="dot" id="consoleDot"></span> <span data-i18n="sidebar.console">Консоль</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="main">
+      <header class="topbar">
+        <div class="search">
+          <input id="searchInput" type="text" data-i18n-placeholder="topbar.searchPlaceholder" placeholder="Знайти гру в бібліотеці…" autocomplete="off" />
+        </div>
+        <div class="account" id="accountArea">
+          <!-- filled by renderer.js -->
+        </div>
+      </header>
+
+      <!-- Not-installed banner for legendary itself -->
+      <div class="banner banner-warn hidden" id="legendaryMissingBanner">
+        <div>
+          <strong data-i18n="banner.legendaryMissingTitle">legendary не знайдено.</strong>
+          <span data-i18n-html="banner.legendaryMissingBody">
+            Bublik Launcher — це інтерфейс поверх CLI-інструмента <code>legendary</code>. Натисни кнопку
+            нижче, щоб він завантажився автоматично (офіційний бінарник з GitHub-релізів), або постав
+            вручну (<code>pip install legendary-gl</code>) і перезапусти застосунок.
+          </span>
+          <div>
+            <button class="btn btn-primary" id="downloadLegendaryBtn" style="margin-top:10px;" data-i18n="banner.downloadLegendary">⚡ Завантажити legendary автоматично</button>
+          </div>
+        </div>
+      </div>
+
+      <section class="view hidden" id="view-store">
+        <div class="store-toolbar">
+          <button class="btn-mini" id="storeBack" data-i18n-title="store.back" title="Назад">←</button>
+          <button class="btn-mini" id="storeForward" data-i18n-title="store.forward" title="Вперед">→</button>
+          <button class="btn-mini" id="storeReload" data-i18n-title="store.reload" title="Оновити">⟳</button>
+          <div class="store-url" id="storeUrl">store.epicgames.com</div>
+        </div>
+        <div class="store-webview-wrap">
+          <webview id="storeWebview" src="about:blank" partition="persist:bublik-epic"></webview>
+        </div>
+      </section>
+
+      <section class="view" id="view-library">
+        <div class="view-head">
+          <h1 data-i18n="library.title">Бібліотека</h1>
+          <span class="view-sub" id="libraryCount"></span>
+        </div>
+        <div class="grid" id="libraryGrid"></div>
+        <div class="empty-state hidden" id="libraryEmpty">
+          <p data-i18n="library.empty">Тут з'явиться твоя бібліотека Epic Games після входу в акаунт.</p>
+        </div>
+      </section>
+
+      <section class="view hidden" id="view-installed">
+        <div class="view-head">
+          <h1 data-i18n="installed.title">Встановлені</h1>
+          <span class="view-sub" id="installedCount"></span>
+        </div>
+        <div class="grid" id="installedGrid"></div>
+        <div class="empty-state hidden" id="installedEmpty">
+          <p data-i18n="installed.empty">Ще немає встановлених ігор. Онови бібліотеку, обери гру та натисни «Встановити».</p>
+        </div>
+      </section>
+
+      <section class="view hidden" id="view-settings">
+        <div class="view-head">
+          <h1 data-i18n="settings.title">Налаштування</h1>
+        </div>
+        <div class="settings-card">
+          <div class="settings-row">
+            <div>
+              <div class="settings-label" data-i18n="settings.accountLabel">Акаунт Epic Games</div>
+              <div class="settings-hint" id="settingsAccountHint" data-i18n="settings.notLoggedIn">Не виконано вхід</div>
+            </div>
+            <button class="btn btn-ghost" id="settingsAuthBtn" data-i18n="account.login">Увійти</button>
+          </div>
+          <div class="settings-row">
+            <div>
+              <div class="settings-label" data-i18n="settings.languageLabel">Мова</div>
+              <div class="settings-hint" data-i18n="settings.languageHint">Мова інтерфейсу застосунку</div>
+            </div>
+            <select class="lang-select" id="languageSelect">
+              <option value="uk">Українська</option>
+              <option value="ru">Русский</option>
+              <option value="en">English</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <div>
+              <div class="settings-label" data-i18n="settings.themeLabel">Тема</div>
+              <div class="settings-hint" data-i18n="settings.themeHint">Колір акценту інтерфейсу</div>
+            </div>
+            <div class="theme-swatches" id="themeSwatches">
+              <button class="theme-swatch" data-theme="amber" style="--swatch-color:#F2A93B" title="Bublik"></button>
+              <button class="theme-swatch" data-theme="emerald" style="--swatch-color:#34D399" title="Emerald"></button>
+              <button class="theme-swatch" data-theme="violet" style="--swatch-color:#A78BFA" title="Violet"></button>
+              <button class="theme-swatch" data-theme="crimson" style="--swatch-color:#FB7185" title="Crimson"></button>
+              <button class="theme-swatch" data-theme="azure" style="--swatch-color:#60A5FA" title="Azure"></button>
+            </div>
+          </div>
+          <div class="settings-row">
+            <div>
+              <div class="settings-label" data-i18n="settings.dataSourceLabel">Джерело даних</div>
+              <div class="settings-hint" data-i18n="settings.dataSourceHint">legendary CLI (опенсорс, community-проєкт, не офіційний клієнт Epic)</div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+  </div>
+
+  <!-- Login modal: Epic's real login page embedded inline (same approach as
+       the store) — not a separate window. We watch for the redirect page
+       and pull the authorization code out of it automatically; manual
+       paste is only a fallback if that doesn't work. -->
+  <div class="modal-overlay hidden" id="loginModal">
+    <div class="modal modal-login">
+      <div class="modal-login-head">
+        <h2 data-i18n="login.title">Увійти в Epic Games</h2>
+        <button class="btn-mini" id="closeLoginBtn" data-i18n="login.close">Закрити</button>
+      </div>
+      <p class="modal-text" data-i18n="login.description">
+        Це справжня сторінка входу epicgames.com, показана прямо тут. Пароль вводиться
+        на ній напряму — Bublik Launcher його не бачить, лише одноразовий код після входу.
+      </p>
+
+      <div class="webview-frame">
+        <webview id="loginWebview" src="about:blank" partition="persist:bublik-epic"></webview>
+        <div class="webview-status" id="webviewStatus" data-i18n="login.loadingPage">Завантаження сторінки Epic…</div>
+      </div>
+
+      <div id="loginError" class="modal-error hidden"></div>
+
+      <button class="btn-mini" id="toggleManualLogin" data-i18n="login.manualToggle">Код не підхопився автоматично? Ввести вручну</button>
+
+      <div class="manual-login hidden" id="manualLoginBlock">
+        <p class="modal-text" data-i18n-html="login.manualDescription">
+          Після входу на сторінці вище має з'явитись JSON з полем <code>authorizationCode</code> —
+          встав його значення (або весь JSON) сюди:
+        </p>
+        <input class="code-input" id="authCodeInput" type="text" data-i18n-placeholder="login.codePlaceholder" placeholder="Код авторизації" autocomplete="off" />
+        <div class="modal-actions">
+          <button class="btn btn-primary" id="submitLoginBtn" data-i18n="login.submit">Увійти з кодом</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Install location picker — shown before any install starts -->
+  <div class="modal-overlay hidden" id="installLocationModal">
+    <div class="modal">
+      <h2 data-i18n="install.title">Куди встановити гру?</h2>
+      <p class="modal-text" data-i18n="install.description">Залиш порожнім, щоб використати теку за замовчуванням legendary (~/legendary).</p>
+      <div class="form-row">
+        <input type="text" class="code-input" id="installPathInput" placeholder="/home/user/Games/EpicGames" />
+        <button class="btn-mini" id="installPathBrowse" data-i18n="common.browse">Огляд</button>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="installLocationCancelBtn" data-i18n="common.cancel">Скасувати</button>
+        <button class="btn btn-primary" id="installLocationConfirmBtn" data-i18n="install.confirm">Завантажити</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Right-click menu on an installed game tile -->
+  <div class="context-menu hidden" id="tileContextMenu">
+    <button class="context-menu-item" id="ctxAutoConfig">⚡ Автоналаштувати анти-чит (Proton)</button>
+    <button class="context-menu-item" id="ctxSettings" data-i18n="ctx.settingsEnabled">⚙ Налаштування (Proton/Wine)</button>
+  </div>
+
+  <!-- Per-game Proton/Wine settings — writes straight into legendary's own
+       config.ini, the same mechanism Heroic uses. -->
+  <div class="modal-overlay hidden" id="gameSettingsModal">
+    <div class="modal modal-settings">
+      <h2 id="gameSettingsTitle">Налаштування гри</h2>
+      <p class="modal-text" data-i18n-html="gs.description">
+        Proton/Wine та інші параметри запуску (актуально для Linux). Записується напряму у
+        <code>config.ini</code> legendary — той самий механізм, яким користується Heroic.
+      </p>
+
+      <div class="settings-form">
+        <button class="btn btn-primary" id="gsAutoConfigBtn" style="width:100%;">⚡ Автоналаштувати все (Proton + анти-чит)</button>
+        <p class="field-hint" style="margin-top:-6px;">
+          Сам знайде/скачає GE-Proton (офіційний відкритий проєкт), створить префікс, знайде Steam і
+          підготує EAC runtime. BattlEye й ручне тонке налаштування — нижче.
+        </p>
+
+        <div class="mode-tabs">
+          <label class="mode-tab"><input type="radio" name="gsMode" id="gsModeWine" value="wine" checked /> <span>Wine</span></label>
+          <label class="mode-tab"><input type="radio" name="gsMode" id="gsModeProton" value="proton" /> <span>Proton</span></label>
+          <label class="mode-tab"><input type="radio" name="gsMode" id="gsModeNative" value="native" /> <span>Нативний Linux</span></label>
+        </div>
+
+        <div id="gsWineFields">
+          <label class="form-label"><span data-i18n="gs.wineExecutable">Wine/Proton виконуваний файл</span>
+            <div class="form-row">
+              <input type="text" id="gsWineExecutable" placeholder="…/GE-Proton/files/bin/wine64" />
+              <button class="btn-mini" data-browse="file" data-target="gsWineExecutable" data-i18n="common.browse">Огляд</button>
+            </div>
+          </label>
+          <label class="form-label"><span data-i18n="gs.winePrefix">Wine-префікс</span>
+            <div class="form-row">
+              <input type="text" id="gsWinePrefix" placeholder="/home/user/Games/prefixes/GameName" />
+              <button class="btn-mini" data-browse="dir" data-target="gsWinePrefix" data-i18n="common.browse">Огляд</button>
+            </div>
+          </label>
+        </div>
+
+        <div id="gsProtonFields" class="hidden">
+          <p class="modal-text" style="margin-top:0;">
+            Це справжній запуск через <code>proton</code> (не просто його Wine-бінарник) — саме так
+            працює EAC/BattlEye runtime нижче. Потрібна тека з файлом <code>proton</code> всередині
+            (напр. GE-Proton чи звичайний Proton зі Steam).
+          </p>
+          <label class="form-label"><span>Тека Proton (з файлом <code>proton</code> всередині)</span>
+            <div class="form-row">
+              <input type="text" id="gsProtonPath" placeholder="…/compatibilitytools.d/GE-Proton9-x" />
+              <button class="btn-mini" data-browse="dir" data-target="gsProtonPath" data-i18n="common.browse">Огляд</button>
+            </div>
+          </label>
+          <label class="form-label"><span>Тека префікса (STEAM_COMPAT_DATA_PATH)</span>
+            <div class="form-row">
+              <input type="text" id="gsCompatDataPath" placeholder="/home/user/Games/prefixes/GameName" />
+              <button class="btn-mini" data-browse="dir" data-target="gsCompatDataPath" data-i18n="common.browse">Огляд</button>
+            </div>
+          </label>
+          <label class="form-label"><span>Тека клієнта Steam (STEAM_COMPAT_CLIENT_INSTALL_PATH)</span>
+            <div class="form-row">
+              <input type="text" id="gsSteamClientPath" placeholder="~/.steam/steam" />
+              <button class="btn-mini" data-browse="dir" data-target="gsSteamClientPath" data-i18n="common.browse">Огляд</button>
+              <button class="btn-mini" id="gsDetectSteam">Автовизначити</button>
+            </div>
+            <span class="field-hint">Обов'язково для Proton — без цього <code>proton</code> одразу впаде з помилкою. Steam можна мати навіть без жодної купленої гри.</span>
+          </label>
+        </div>
+
+        <div id="gsNativeFields" class="hidden">
+          <p class="modal-text" style="margin-top:0;">
+            Гра запускається напряму, без Wine чи Proton — для нативних Linux-білдів.
+          </p>
+        </div>
+
+        <label class="form-label"><span data-i18n="gs.wrapper">Обгортка запуску (wrapper)</span>
+          <input type="text" id="gsWrapper" placeholder="gamemoderun" />
+          <span class="field-hint">Опційно, ставиться перед командою запуску (працює для всіх режимів вище).</span>
+        </label>
+
+        <label class="form-label"><span data-i18n="gs.startParams">Додаткові параметри запуску</span>
+          <input type="text" id="gsStartParams" placeholder="-windowed" />
+        </label>
+
+        <label class="checkbox-row"><input type="checkbox" id="gsOffline" /> <span data-i18n="gs.offline">Запускати офлайн (без онлайн-автентифікації)</span></label>
+        <label class="checkbox-row"><input type="checkbox" id="gsSkipUpdate" /> <span data-i18n="gs.skipUpdate">Не перевіряти оновлення при запуску</span></label>
+
+        <div class="anticheat-block">
+          <div class="anticheat-block-title" data-i18n="gs.anticheatTitle">Easy Anti-Cheat / BattlEye Runtime (Linux)</div>
+          <p class="modal-text" style="margin-top:0;" data-i18n-html="gs.anticheatDescription">
+            Це той самий механізм, яким користується Heroic. Файли розповсюджує Valve безкоштовно
+            через Steam — інструменти <code>Proton EasyAntiCheat Runtime</code> та
+            <code>Proton BattlEye Runtime</code> можна встановити на акаунт і завантажити навіть без
+            жодної гри в Steam. Встанови потрібний(і) один раз, вкажи шлях нижче — далі просто галочка.
+          </p>
+          <div id="gsAnticheatWineWarning" class="field-warning hidden">
+            ⚠ Потребує режиму <strong>Proton</strong> вище — під звичайним Wine ці змінні нічого не роблять.
+          </div>
+          <label class="checkbox-row"><input type="checkbox" id="gsEacEnabled" /> <span data-i18n="gs.eacEnabled">Увімкнути EasyAntiCheat Runtime</span></label>
+          <div class="form-row">
+            <input type="text" id="gsEacPath" placeholder="…/steamapps/common/Proton EasyAntiCheat Runtime" />
+            <button class="btn-mini" data-browse="dir" data-target="gsEacPath" data-i18n="common.browse">Огляд</button>
+            <button class="btn-mini" id="gsEacAutoDownload" data-i18n="gs.download" title="Community-дзеркало, може бути застарілим">Завантажити</button>
+          </div>
+          <label class="checkbox-row"><input type="checkbox" id="gsBattlEyeEnabled" /> <span data-i18n="gs.battlEyeEnabled">Увімкнути BattlEye Runtime</span></label>
+          <div class="form-row">
+            <input type="text" id="gsBattlEyePath" placeholder="…/steamapps/common/Proton BattlEye Runtime" />
+            <button class="btn-mini" data-browse="dir" data-target="gsBattlEyePath" data-i18n="common.browse">Огляд</button>
+          </div>
+        </div>
+
+        <label class="form-label"><span data-i18n="gs.envVarsLabel">Додаткові змінні середовища (по одній на рядок, KEY=VALUE)</span>
+          <textarea id="gsEnvVars" rows="3" placeholder="DXVK_CONFIG_FILE=/path/to/dxvk.conf"></textarea>
+        </label>
+      </div>
+
+      <div class="anticheat-note" data-i18n-html="gs.anticheatNote">
+        <strong>Чесно про межі цього.</strong> EAC/BattlEye runtime вище працює лише в режимі
+        <strong>Proton</strong> (не Wine) — це реальна вимога самого Proton, а не примха цього
+        лаунчера: змінні <code>PROTON_EAC_RUNTIME</code>/<code>PROTON_BATTLEYE_RUNTIME</code> читає
+        скрипт <code>proton</code>, а не звичайний Wine-бінарник. Навіть у режимі Proton — це вмикає
+        лише <em>можливість</em> ініціалізації анти-чита, а чи саму гру пропустить конкретний
+        анти-чит-деплой, вирішує розробник на своєму боці. Fortnite Epic блокує на Linux свідомо — це
+        не обійти жодним налаштуванням тут.
+      </div>
+
+      <div id="gameSettingsError" class="modal-error hidden"></div>
+
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="gsCancelBtn" data-i18n="common.cancel">Скасувати</button>
+        <button class="btn btn-primary" id="gsSaveBtn" data-i18n="common.save">Зберегти</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Console drawer -->
+  <div class="console-drawer" id="consoleDrawer">
+    <div class="console-head">
+      <span data-i18n="console.title">Вивід legendary</span>
+      <button id="consoleClear" class="btn-mini" data-i18n="common.clear">Очистити</button>
+    </div>
+    <div class="console-body" id="consoleBody"></div>
+  </div>
+
+  <script src="i18n.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

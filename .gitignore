@@ -1,0 +1,27 @@
+# Dependencies (huge, and reproducible from package.json)
+node_modules/
+
+# electron-builder output
+dist/
+out/
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local env overrides, if you ever add one
+.env
+.env.local
+
+# NOTE: this app deliberately does NOT store any Epic credentials, tokens,
+# or session data inside this project folder — see README.md. Everything
+# sensitive (legendary's own auth token, the Wine/Proton game settings, the
+# EAC/BattlEye runtime cache, downloaded GE-Proton builds, per-game prefixes,
+# playtime stats) lives outside the repo entirely, under the user's own
+# ~/.config/legendary/ and ~/.config/bublik-launcher/ — so there's nothing
+# machine-specific to exclude here beyond the standard entries above.
