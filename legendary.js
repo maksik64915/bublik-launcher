@@ -110,10 +110,47 @@ function pickLegendaryAsset(assets) {
   );
 }
 
+// Actually runs the binary (--version) rather than just checking it exists —
+// a file can be present on disk and still be non-functional (wrong
+// architecture, missing native deps, etc, as happened with a 0.21.0 zipapp
+// asset missing a compiled Cryptodome module for one user's Python ABI).
+// Without this check, a broken cached copy would report "ready" forever.
+function verifyLegendaryBinary(binPath) {
+  return new Promise((resolve) => {
+    let proc;
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      if (proc && proc.exitCode === null && !proc.killed) {
+        try { proc.kill(); } catch { /* already gone */ }
+      }
+      resolve(ok);
+    };
+    try {
+      proc = spawn(binPath, ['--version'], { windowsHide: true });
+    } catch {
+      finish(false);
+      return;
+    }
+    proc.on('error', () => finish(false));
+    proc.on('close', (code) => finish(code === 0));
+    setTimeout(() => finish(false), 15000);
+  });
+}
+
 async function downloadLegendaryBinary(onProgress) {
   const log = onProgress || (() => {});
   const targetPath = getManagedLegendaryPath();
-  if (fs.existsSync(targetPath)) return { ok: true, path: targetPath, cached: true };
+
+  if (fs.existsSync(targetPath)) {
+    log('Перевіряю вже завантажений legendary...');
+    if (await verifyLegendaryBinary(targetPath)) {
+      return { ok: true, path: targetPath, cached: true };
+    }
+    log('Наявна копія не запускається на цій системі (пошкоджена або несумісна збірка) — видаляю й пробую наново.');
+    try { fs.rmSync(targetPath, { force: true }); } catch { /* best effort */ }
+  }
 
   log('Шукаю останній реліз legendary на GitHub...');
   let release;
@@ -147,6 +184,18 @@ async function downloadLegendaryBinary(onProgress) {
     if (process.platform !== 'win32') {
       fs.chmodSync(targetPath, 0o755);
     }
+
+    log('Перевіряю, чи запускається завантажений файл...');
+    if (!(await verifyLegendaryBinary(targetPath))) {
+      try { fs.rmSync(targetPath, { force: true }); } catch { /* best effort */ }
+      return {
+        ok: false,
+        message: `Завантажений файл (${asset.name}, ${release.tag_name || ''}) не запускається на цій ` +
+          'системі — судячи з усього, несумісна збірка від розробників legendary для цієї платформи. ' +
+          'Постав вручну: pip install legendary-gl',
+      };
+    }
+
     return { ok: true, path: targetPath, cached: false, version: release.tag_name };
   } catch (err) {
     try { fs.unlinkSync(targetPath); } catch { /* nothing to clean up */ }
