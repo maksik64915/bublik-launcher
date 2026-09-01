@@ -738,16 +738,20 @@
     renderInstalled();
   }
 
-  async function boot() {
-    const check = await window.bublik.checkInstalled();
-    if (!check.installed) {
-      legendaryMissingBanner.classList.remove('hidden');
-    }
+  async function refreshAppState() {
     const playtimeData = await window.bublik.getPlaytime();
     state.playtime = new Map(Object.entries(playtimeData || {}));
     await refreshAuth();
     await refreshInstalled();
     await refreshLibrary();
+  }
+
+  async function boot() {
+    const check = await window.bublik.checkInstalled();
+    if (!check.installed) {
+      legendaryMissingBanner.classList.remove('hidden');
+    }
+    await refreshAppState();
   }
 
   $('#downloadLegendaryBtn').addEventListener('click', async () => {
@@ -757,14 +761,19 @@
     btn.textContent = t('banner.downloading');
     consoleDrawer.classList.add('is-open');
     const res = await window.bublik.downloadLegendary();
+    btn.disabled = false;
+    btn.textContent = originalText;
     if (res.ok) {
       logLine(null, `legendary ${res.version || ''} готовий.`, false);
       legendaryMissingBanner.classList.add('hidden');
-      await boot();
+      // Trust the download's own just-completed verification instead of
+      // immediately re-spawning the binary via boot()'s checkInstalled —
+      // that redundant back-to-back re-check was flaky (a fresh success
+      // could get contradicted a few milliseconds later) and would silently
+      // pop the banner back up right after confirming everything worked.
+      await refreshAppState();
     } else {
       logLine(null, res.message || t('banner.downloadFailed'), true);
-      btn.disabled = false;
-      btn.textContent = originalText;
     }
   });
 
