@@ -85,7 +85,30 @@ async function checkInstalled() {
 // exact path for people without Python: "Download the legendary or
 // legendary.exe binary from the latest release" — these are official
 // PyInstaller-built standalone binaries, not a third-party mirror.
-const LEGENDARY_RELEASES_API = 'https://api.github.com/repos/derrod/legendary/releases/latest';
+// The project moved from derrod/legendary to legendary-gl/legendary (org
+// transfer, 2026) alongside a build-tooling overhaul — asset naming has
+// shifted between releases before and may again, so we match by pattern
+// instead of requiring one exact filename.
+const LEGENDARY_RELEASES_API = 'https://api.github.com/repos/legendary-gl/legendary/releases/latest';
+
+function pickLegendaryAsset(assets) {
+  const notPackaging = (name) => !/\.(whl|tar\.gz|zip|sha256|asc|txt|sig)$/i.test(name);
+  if (process.platform === 'win32') {
+    return assets.find((a) => /legendary.*\.exe$/i.test(a.name));
+  }
+  if (process.platform === 'darwin') {
+    return (
+      assets.find((a) => /legendary.*mac/i.test(a.name) && notPackaging(a.name)) ||
+      assets.find((a) => /^legendary$/i.test(a.name))
+    );
+  }
+  // linux
+  return (
+    assets.find((a) => /^legendary$/i.test(a.name)) ||
+    assets.find((a) => /^legendary[-_]linux/i.test(a.name) && notPackaging(a.name)) ||
+    assets.find((a) => /^legendary/i.test(a.name) && notPackaging(a.name) && !/mac|win|exe/i.test(a.name))
+  );
+}
 
 async function downloadLegendaryBinary(onProgress) {
   const log = onProgress || (() => {});
@@ -100,13 +123,14 @@ async function downloadLegendaryBinary(onProgress) {
     return { ok: false, message: 'Не вдалося звернутись до GitHub: ' + String((err && err.message) || err) };
   }
 
-  const assetName = process.platform === 'win32' ? 'legendary.exe' : 'legendary';
-  const asset = (release.assets || []).find((a) => a.name === assetName);
+  const assets = release.assets || [];
+  const asset = pickLegendaryAsset(assets);
   if (!asset) {
+    const names = assets.map((a) => a.name).join(', ') || '(список файлів порожній)';
     return {
       ok: false,
-      message: `Не знайдено файл "${assetName}" у релізі legendary ${release.tag_name || ''}. ` +
-        'Постав вручну: pip install legendary-gl',
+      message: `Не знайдено відповідний файл у релізі legendary ${release.tag_name || ''}. ` +
+        `Наявні файли: ${names}. Постав вручну: pip install legendary-gl`,
     };
   }
 
