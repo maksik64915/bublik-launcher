@@ -23,6 +23,25 @@ const fs = require('fs');
 // copy (see downloadLegendaryBinary below) > whatever's on PATH.
 const LEGENDARY_BIN_DIR = path.join(os.homedir(), '.config', 'bublik-launcher', 'bin');
 
+// Some distros put pip's `--user` console scripts in a bin dir we don't
+// scan, or don't place a script at all in some edge configurations, even
+// though the `legendary` *package* itself installed fine and is fully
+// importable. Rather than declare defeat, we remember "the direct binary
+// didn't work but `python3 -m legendary` did" here and use that mode from
+// then on. Delete this file to make bublik-launcher re-probe from scratch.
+const LEGENDARY_MODE_FILE = path.join(os.homedir(), '.config', 'bublik-launcher', 'legendary-mode.json');
+
+function readLegendaryMode() {
+  try { return JSON.parse(fs.readFileSync(LEGENDARY_MODE_FILE, 'utf8')); } catch { return null; }
+}
+
+function writeLegendaryMode(mode) {
+  try {
+    fs.mkdirSync(path.dirname(LEGENDARY_MODE_FILE), { recursive: true });
+    fs.writeFileSync(LEGENDARY_MODE_FILE, JSON.stringify(mode), 'utf8');
+  } catch { /* best effort — worst case we just re-probe next run */ }
+}
+
 function getManagedLegendaryPath() {
   const name = process.platform === 'win32' ? 'legendary.exe' : 'legendary';
   return path.join(LEGENDARY_BIN_DIR, name);
@@ -32,6 +51,23 @@ function resolveLegendaryBin() {
   if (process.env.BUBLIK_LEGENDARY_BIN) return process.env.BUBLIK_LEGENDARY_BIN;
   const managed = getManagedLegendaryPath();
   if (fs.existsSync(managed)) return managed;
+  // GUI-launched apps (double-clicked AppImage, .desktop entry) often
+  // inherit a slimmer PATH than an interactive shell — a `pip install
+  // --user` binary lands in ~/.local/bin, which shells add via .bashrc/
+  // .profile but a desktop session frequently does not. `legendary
+  // --version` working fine in a terminal while this app still can't find
+  // it is usually exactly this, not a real "not installed" situation.
+  if (process.platform !== 'win32') {
+    const commonPaths = [
+      path.join(os.homedir(), '.local', 'bin', 'legendary'),
+      '/usr/local/bin/legendary',
+      '/usr/bin/legendary',
+      path.join(os.homedir(), '.local', 'share', 'pipx', 'venvs', 'legendary-gl', 'bin', 'legendary'),
+    ];
+    for (const candidate of commonPaths) {
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  }
   return 'legendary';
 }
 
@@ -39,7 +75,12 @@ function run(args, { onLine } = {}) {
   return new Promise((resolve, reject) => {
     let proc;
     try {
-      proc = spawn(resolveLegendaryBin(), args, { windowsHide: true });
+      const mode = readLegendaryMode();
+      if (mode && mode.type === 'module' && mode.python) {
+        proc = spawn(mode.python, ['-c', 'from legendary.cli import main; main()', ...args], { windowsHide: true });
+      } else {
+        proc = spawn(resolveLegendaryBin(), args, { windowsHide: true });
+      }
     } catch (err) {
       reject(err);
       return;
@@ -93,20 +134,25 @@ const LEGENDARY_RELEASES_API = 'https://api.github.com/repos/legendary-gl/legend
 
 function pickLegendaryAsset(assets) {
   const notPackaging = (name) => !/\.(whl|tar\.gz|zip|sha256|asc|txt|sig)$/i.test(name);
+  const notArm = (name) => !/aarch64|arm64|[-_]arm(?:[^a-z0-9]|$)/i.test(name);
   if (process.platform === 'win32') {
-    return assets.find((a) => /legendary.*\.exe$/i.test(a.name));
+    return assets.find((a) => /legendary.*\.exe$/i.test(a.name) && notArm(a.name));
   }
   if (process.platform === 'darwin') {
     return (
-      assets.find((a) => /legendary.*mac/i.test(a.name) && notPackaging(a.name)) ||
+      assets.find((a) => /legendary.*mac/i.test(a.name) && notPackaging(a.name) && notArm(a.name)) ||
       assets.find((a) => /^legendary$/i.test(a.name))
     );
   }
-  // linux
+  // linux — a release can ship both x86_64 and arm64 builds; picking the
+  // first "starts with legendary" match once grabbed an arm64 file on a
+  // normal x86_64 machine ("Exec format error"-class bug), so architecture
+  // exclusion has to apply at every fallback tier, not just the loosest one.
   return (
     assets.find((a) => /^legendary$/i.test(a.name)) ||
-    assets.find((a) => /^legendary[-_]linux/i.test(a.name) && notPackaging(a.name)) ||
-    assets.find((a) => /^legendary/i.test(a.name) && notPackaging(a.name) && !/mac|win|exe/i.test(a.name))
+    assets.find((a) => /^legendary[-_](linux[-_]?)?(x86[-_]?64|amd64)/i.test(a.name) && notPackaging(a.name)) ||
+    assets.find((a) => /^legendary[-_]linux/i.test(a.name) && notPackaging(a.name) && notArm(a.name)) ||
+    assets.find((a) => /^legendary/i.test(a.name) && notPackaging(a.name) && notArm(a.name) && !/mac|win|exe/i.test(a.name))
   );
 }
 
@@ -115,92 +161,205 @@ function pickLegendaryAsset(assets) {
 // architecture, missing native deps, etc, as happened with a 0.21.0 zipapp
 // asset missing a compiled Cryptodome module for one user's Python ABI).
 // Without this check, a broken cached copy would report "ready" forever.
+// Returns { ok, stderr } instead of a bare boolean — a failure's actual
+// error text (e.g. a Python traceback from a broken upstream build) is what
+// makes the next bug report diagnosable instead of another guessing round.
 function verifyLegendaryBinary(binPath) {
   return new Promise((resolve) => {
     let proc;
     let settled = false;
+    let stderr = '';
     const finish = (ok) => {
       if (settled) return;
       settled = true;
       if (proc && proc.exitCode === null && !proc.killed) {
         try { proc.kill(); } catch { /* already gone */ }
       }
-      resolve(ok);
+      resolve({ ok, stderr: stderr.trim() });
     };
     try {
       proc = spawn(binPath, ['--version'], { windowsHide: true });
-    } catch {
-      finish(false);
+    } catch (err) {
+      resolve({ ok: false, stderr: String((err && err.message) || err) });
       return;
     }
-    proc.on('error', () => finish(false));
+    if (proc.stderr) proc.stderr.on('data', (buf) => { stderr += buf.toString('utf8'); });
+    proc.on('error', (err) => finish(false, err));
     proc.on('close', (code) => finish(code === 0));
     setTimeout(() => finish(false), 15000);
   });
 }
 
+// Same idea as verifyLegendaryBinary, but for `python -m legendary` — used
+// after a pip install when no working console-script binary can be found on
+// disk. pip installing the package successfully (exit code 0) does NOT
+// guarantee a working `legendary` command afterwards: on some distros the
+// `--user` scripts dir isn't where we expect, or (as seen in the wild) pip
+// fails to write the console-script file at all if that scripts dir didn't
+// already exist — but the package itself still lands in site-packages fine.
+// legendary-gl has no `legendary/__main__.py`, so `python -m legendary`
+// does NOT work ("package and cannot be directly executed") — its actual
+// console-script entry point is `legendary.cli:main`, so we call that
+// directly instead, exactly like the generated script would.
+function verifyPythonModule(python) {
+  return new Promise((resolve) => {
+    let proc;
+    let settled = false;
+    let stderr = '';
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      if (proc && proc.exitCode === null && !proc.killed) {
+        try { proc.kill(); } catch { /* already gone */ }
+      }
+      resolve({ ok, stderr: stderr.trim() });
+    };
+    try {
+      proc = spawn(python, ['-c', 'from legendary.cli import main; main()', '--version'], { windowsHide: true });
+    } catch (err) {
+      resolve({ ok: false, stderr: String((err && err.message) || err) });
+      return;
+    }
+    if (proc.stderr) proc.stderr.on('data', (buf) => { stderr += buf.toString('utf8'); });
+    proc.on('error', (err) => finish(false, err));
+    proc.on('close', (code) => finish(code === 0));
+    setTimeout(() => finish(false), 15000);
+  });
+}
+
+// Tries `pip install --user legendary-gl` (a few command/flag combos) as an
+// automatic fallback when the standalone binary doesn't work. This installs
+// a build matched to the system's actual Python instead of a generic
+// prebuilt binary — closes exactly the gap the 0.21.0 Linux binary's own
+// packaging bug leaves open, without the user ever touching a terminal.
+async function tryPipInstall(onLine) {
+  const log = onLine || (() => {});
+  const pipCmds = process.platform === 'win32' ? ['pip', 'pip3'] : ['pip3', 'pip'];
+  // Some distros (Debian/Ubuntu 23.04+, Fedora) block plain `pip install
+  // --user` under PEP 668 ("externally managed environment") unless told
+  // otherwise — try the plain form first, then with the override flag.
+  const flagSets = [['--user'], ['--user', '--break-system-packages']];
+
+  // `pip install --user` writes its console-script (the `legendary`
+  // command) straight into ~/.local/bin — and on a system where that
+  // directory has never been created (no prior --user installs), pip can
+  // fail deep into the install with a raw OSError ("No such file or
+  // directory") on that exact path, even though the package itself already
+  // unpacked into site-packages fine. Make sure the target exists first so
+  // that specific failure mode can't happen.
+  if (process.platform !== 'win32') {
+    try { fs.mkdirSync(path.join(os.homedir(), '.local', 'bin'), { recursive: true }); } catch { /* best effort */ }
+  }
+
+  for (const cmd of pipCmds) {
+    for (const flags of flagSets) {
+      log(`Пробую: ${cmd} install ${flags.join(' ')} legendary-gl`);
+      const ok = await new Promise((resolve) => {
+        let proc;
+        try {
+          proc = spawn(cmd, ['install', ...flags, 'legendary-gl'], { windowsHide: true });
+        } catch {
+          resolve(false);
+          return;
+        }
+        proc.on('error', () => resolve(false));
+        proc.on('close', (code) => resolve(code === 0));
+      });
+      if (ok) return { ok: true, via: `${cmd} ${flags.join(' ')}` };
+    }
+  }
+  return { ok: false };
+}
+
 async function downloadLegendaryBinary(onProgress) {
   const log = onProgress || (() => {});
   const targetPath = getManagedLegendaryPath();
+  let binaryFailureMessage = null;
 
   if (fs.existsSync(targetPath)) {
     log('Перевіряю вже завантажений legendary...');
-    if (await verifyLegendaryBinary(targetPath)) {
+    const cachedCheck = await verifyLegendaryBinary(targetPath);
+    if (cachedCheck.ok) {
       return { ok: true, path: targetPath, cached: true };
     }
-    log('Наявна копія не запускається на цій системі (пошкоджена або несумісна збірка) — видаляю й пробую наново.');
+    log('Наявна копія не запускається на цій системі — видаляю й пробую наново.');
     try { fs.rmSync(targetPath, { force: true }); } catch { /* best effort */ }
   }
 
   log('Шукаю останній реліз legendary на GitHub...');
-  let release;
   try {
-    release = await httpsGetJson(LEGENDARY_RELEASES_API);
-  } catch (err) {
-    return { ok: false, message: 'Не вдалося звернутись до GitHub: ' + String((err && err.message) || err) };
-  }
+    const release = await httpsGetJson(LEGENDARY_RELEASES_API);
+    const assets = release.assets || [];
+    const asset = pickLegendaryAsset(assets);
+    if (!asset) {
+      const names = assets.map((a) => a.name).join(', ') || '(список файлів порожній)';
+      binaryFailureMessage = `Не знайдено відповідний файл у релізі legendary ${release.tag_name || ''}. Наявні файли: ${names}.`;
+    } else {
+      log(`Завантажую ${asset.name} (${release.tag_name || ''})...`);
+      const res = await httpsGetFollowing(asset.browser_download_url);
+      fs.mkdirSync(LEGENDARY_BIN_DIR, { recursive: true });
+      await new Promise((resolve, reject) => {
+        const file = fs.createWriteStream(targetPath);
+        res.pipe(file);
+        file.on('finish', () => file.close(resolve));
+        file.on('error', reject);
+      });
+      if (process.platform !== 'win32') fs.chmodSync(targetPath, 0o755);
 
-  const assets = release.assets || [];
-  const asset = pickLegendaryAsset(assets);
-  if (!asset) {
-    const names = assets.map((a) => a.name).join(', ') || '(список файлів порожній)';
-    return {
-      ok: false,
-      message: `Не знайдено відповідний файл у релізі legendary ${release.tag_name || ''}. ` +
-        `Наявні файли: ${names}. Постав вручну: pip install legendary-gl`,
-    };
-  }
-
-  log(`Завантажую ${asset.name} (${release.tag_name || ''})...`);
-  try {
-    const res = await httpsGetFollowing(asset.browser_download_url);
-    fs.mkdirSync(LEGENDARY_BIN_DIR, { recursive: true });
-    await new Promise((resolve, reject) => {
-      const file = fs.createWriteStream(targetPath);
-      res.pipe(file);
-      file.on('finish', () => file.close(resolve));
-      file.on('error', reject);
-    });
-    if (process.platform !== 'win32') {
-      fs.chmodSync(targetPath, 0o755);
-    }
-
-    log('Перевіряю, чи запускається завантажений файл...');
-    if (!(await verifyLegendaryBinary(targetPath))) {
+      log('Перевіряю, чи запускається завантажений файл...');
+      const check = await verifyLegendaryBinary(targetPath);
+      if (check.ok) {
+        return { ok: true, path: targetPath, cached: false, version: release.tag_name };
+      }
       try { fs.rmSync(targetPath, { force: true }); } catch { /* best effort */ }
-      return {
-        ok: false,
-        message: `Завантажений файл (${asset.name}, ${release.tag_name || ''}) не запускається на цій ` +
-          'системі — судячи з усього, несумісна збірка від розробників legendary для цієї платформи. ' +
-          'Постав вручну: pip install legendary-gl',
-      };
+      const errSnippet = check.stderr ? check.stderr.slice(-500) : '(немає виводу помилки)';
+      binaryFailureMessage =
+        `Завантажений файл (${asset.name}, ${release.tag_name || ''}) не запускається. Помилка: ${errSnippet}`;
     }
-
-    return { ok: true, path: targetPath, cached: false, version: release.tag_name };
   } catch (err) {
-    try { fs.unlinkSync(targetPath); } catch { /* nothing to clean up */ }
-    return { ok: false, message: String((err && err.message) || err) };
+    binaryFailureMessage = 'Не вдалося звернутись до GitHub: ' + String((err && err.message) || err);
   }
+
+  // Standalone binary route failed — automatically fall back to pip instead
+  // of just telling the user to run it themselves.
+  log('Готовий бінарник не спрацював — пробую встановити через pip (пакунок під саме твій Python)...');
+  const pipResult = await tryPipInstall(log);
+  let pipFailureDetail = null;
+  if (pipResult.ok) {
+    log(`Встановлено через "${pipResult.via} legendary-gl" — перевіряю...`);
+    const directCheck = await verifyLegendaryBinary(resolveLegendaryBin());
+    if (directCheck.ok) {
+      return { ok: true, path: resolveLegendaryBin(), viaPip: true };
+    }
+    // pip reported success but there's still no working `legendary` command
+    // on disk (script landed somewhere we don't scan, PATH oddities, etc).
+    // The package itself installed fine though, so try running it as a
+    // module before giving up entirely.
+    log('Команду "legendary" не знайдено після встановлення — пробую "python -m legendary"...');
+    let moduleOk = false;
+    for (const py of ['python3', 'python']) {
+      const modCheck = await verifyPythonModule(py);
+      if (modCheck.ok) {
+        writeLegendaryMode({ type: 'module', python: py });
+        moduleOk = true;
+        return { ok: true, path: `${py} -m legendary`, viaPip: true, viaModule: true };
+      }
+      if (modCheck.stderr) pipFailureDetail = modCheck.stderr.slice(-500);
+    }
+    if (!moduleOk && !pipFailureDetail) {
+      pipFailureDetail = directCheck.stderr || null;
+    }
+  }
+
+  return {
+    ok: false,
+    message: `${binaryFailureMessage}\n\nАвтоматична спроба через pip теж не вдалась` +
+      (pipFailureDetail
+        ? `. Остання помилка: ${pipFailureDetail}`
+        : ' (або pip не знайдено в системі).') +
+      '\n\nПостав вручну: pip install legendary-gl — і переконайся, що ~/.local/bin є в PATH, ' +
+      'або спробуй "python3 -m legendary --version" щоб перевірити пакунок напряму.',
+  };
 }
 
 async function checkAuthStatus() {
